@@ -37,6 +37,7 @@ import pathlib
 import argparse
 import typing
 import io
+import json
 
 Label = str
 Var = str
@@ -309,6 +310,11 @@ class MM:
         self.stop_label = stop_label
         self.verify_proofs = not self.begin_label
 
+        # Variables for JSON export.
+        self.exported_proofs = {}
+        self.current_step_id = 0
+        self.current_proof_log = []
+
     def add_c(self, tok: Const) -> None:
         """Add a constant to the database."""
         if '$' in tok:
@@ -444,7 +450,7 @@ class MM:
                 dvs, f_hyps, e_hyps, conclusion = self.fs.make_assertion(stmt)
                 if self.verify_proofs:
                     vprint(2, 'Verify:', label)
-                    self.verify(f_hyps, e_hyps, conclusion, proof)
+                    self.verify(f_hyps, e_hyps, conclusion, proof, label)
                 self.labels[label] = ('$p', (dvs, f_hyps, e_hyps, conclusion))
                 label = None
             elif tok == '$d':
@@ -472,14 +478,16 @@ class MM:
 
     def treat_step(self,
                    step: FullStmt,
-                   stack: list[Stmt]) -> None:
+                   stack: list[Stmt],
+                   step_label: str) -> None:
         """Carry out the given proof step (given the label to treat and the
         current proof stack).  This modifies the given stack in place.
         """
         vprint(10, 'Proof step:', step)
         if is_hypothesis(step):
             _steptype, stmt = step
-            stack.append(stmt)
+            new_stmt = stmt
+            popped_ids = []
         elif is_assertion(step):
             _steptype, assertion = step
             dvs0, f_hyps0, e_hyps0, conclusion0 = assertion
@@ -492,22 +500,25 @@ class MM:
                         step,
                         npop))
             subst: dict[Var, Stmt] = {}
+            popped_ids = []
             for typecode, var in f_hyps0:
-                entry = stack[sp]
-                if entry[0] != typecode:
+                entry_stmt, entry_id = stack[sp]
+                popped_ids.append(entry_id)
+                if entry_stmt[0] != typecode:
                     raise MMError(
                         ("Proof stack entry {} does not match floating " +
-                         "hypothesis ({}, {}).").format(entry, typecode, var))
-                subst[var] = entry[1:]
+                         "hypothesis ({}, {}).").format(entry_stmt, typecode, var))
+                subst[var] = entry_stmt[1:]
                 sp += 1
             vprint(15, 'Substitution to apply:', subst)
             for h in e_hyps0:
-                entry = stack[sp]
+                entry_stmt, entry_id = stack[sp]
+                popped_ids.append(entry_id)
                 subst_h = apply_subst(h, subst)
-                if entry != subst_h:
+                if entry_stmt != subst_h:
                     raise MMError(("Proof stack entry {} does not match " +
                                    "essential hypothesis {}.")
-                                  .format(entry, subst_h))
+                                  .format(entry_stmt, subst_h))
                 sp += 1
             for x, y in dvs0:
                 vprint(16, 'dist', x, y, subst[x], subst[y])
@@ -520,14 +531,31 @@ class MM:
                         raise MMError("Disjoint variable violation: " +
                                       "{} , {}".format(x0, y0))
             del stack[len(stack) - npop:]
-            stack.append(apply_subst(conclusion0, subst))
+            new_stmt = apply_subst(conclusion0, subst)
+
+        # Generate a new monotonically increasing step ID for JSON export.
+        self.current_step_id += 1
+        new_step_id = self.current_step_id
+
+        # Log the step
+        self.current_proof_log.append({
+            "step": new_step_id,
+            "ref": step_label,
+            "type": new_stmt[0],
+            "expr": " ".join(new_stmt),
+            "args": popped_ids
+        })
+
+        stack.append((new_stmt, new_step_id))
         vprint(12, 'Proof stack:', stack)
 
-    def treat_normal_proof(self, proof: list[str]) -> list[Stmt]:
+    def treat_normal_proof(self, proof: list[str], proof_label: str) -> list[Stmt]:
         """Return the proof stack once the given normal proof has been
         processed.
         """
-        stack: list[Stmt] = []
+        stack: list[tuple[Stmt, int]] = []
+        self.current_step_id = 0
+        self.current_proof_log = []
         active_hypotheses = {label for frame in self.fs for labels in (frame.f_labels, frame.e_labels) for label in labels.values()}
         for label in proof:
             stmt_info = self.labels.get(label)
@@ -535,7 +563,7 @@ class MM:
                 label_type = stmt_info[0]
                 if label_type in {'$e', '$f'}:
                     if label in active_hypotheses:
-                        self.treat_step(stmt_info, stack)
+                        self.treat_step(stmt_info, stack, label)
                     else:
                         raise MMError(f"The label {label} is the label of a nonactive hypothesis.")
                 else:
@@ -548,7 +576,8 @@ class MM:
             self,
             f_hyps: list[Fhyp],
             e_hyps: list[Ehyp],
-            proof: list[str]) -> list[Stmt]:
+            proof: list[str],
+            proof_label: str) -> list[Stmt]:
         """Return the proof stack once the given compressed proof for an
         assertion with the given $f and $e-hypotheses has been processed.
         """
@@ -576,7 +605,9 @@ class MM:
                 cur_int = 5 * cur_int + ord(ch) - 84  # ord('U') = 85
         vprint(5, 'Integer-coded steps:', proof_ints)
         # Processing of the proof
-        stack: list[Stmt] = []  # proof stack
+        stack: list[tuple[Stmt, int]] = []  # proof stack
+        self.current_step_id = 0
+        self.current_proof_log = []
         # statements saved for later reuse (marked with a 'Z')
         saved_stmts = []
         # can be recovered as len(saved_stmts) but less efficient
@@ -590,23 +621,17 @@ class MM:
             elif proof_int < label_end:
                 # proof_int denotes an implicit hypothesis or a label in the
                 # label bloc
-                self.treat_step(self.labels[plabels[proof_int] or ''], stack)
+                step_label = plabels[proof_int] or ''
+                self.treat_step(self.labels[plabels[proof_int] or ''], stack, step_label)
             elif proof_int >= label_end + n_saved_stmts:
                 raise MMError(
                     ("Not enough saved proof steps ({} saved but calling " +
                     "the {}th).").format(
                         n_saved_stmts,
                         proof_int))
-            else:  # label_end <= proof_int < label_end + n_saved_stmts
-                # proof_int denotes an earlier proof step marked with a 'Z'
-                # A proof step that has already been proved can be treated as
-                # a dv-free and hypothesis-free axiom.
+            else: # Re-pushing the saved tuple directly retains its original Step ID
                 stmt = saved_stmts[proof_int - label_end]
-                vprint(15, 'Reusing step', stmt)
-                self.treat_step(
-                    ('$a',
-                     (set(), [], [], stmt)),
-                    stack)
+                stack.append(stmt)
         return stack
 
     def verify(
@@ -614,7 +639,8 @@ class MM:
             f_hyps: list[Fhyp],
             e_hyps: list[Ehyp],
             conclusion: Stmt,
-            proof: list[str]) -> None:
+            proof: list[str],
+            proof_label: str) -> None:
         """Verify that the given proof (in normal or compressed format) is a
         correct proof of the given assertion.
         """
@@ -622,9 +648,9 @@ class MM:
         # assertion as an argument since other dv conditions corresponding to
         # dummy variables should be 'lookup_d'ed anyway.
         if proof[0] == '(':  # compressed format
-            stack = self.treat_compressed_proof(f_hyps, e_hyps, proof)
+            stack = self.treat_compressed_proof(f_hyps, e_hyps, proof, proof_label)
         else:  # normal format
-            stack = self.treat_normal_proof(proof)
+            stack = self.treat_normal_proof(proof, proof_label)
         vprint(10, 'Stack at end of proof:', stack)
         if not stack:
             raise MMError(
@@ -633,11 +659,12 @@ class MM:
             raise MMError(
                 "Stack has more than one entry at end of proof (top " +
                 "entry: {} ; proved assertion: {}).".format(
-                    stack[0],
+                    stack[0][0],
                     conclusion))
-        if stack[0] != conclusion:
+        if stack[0][0] != conclusion:
             raise MMError(("Stack entry {} does not match proved " +
-                          " assertion {}.").format(stack[0], conclusion))
+                          " assertion {}.").format(stack[0][0], conclusion))
+        self.exported_proofs[proof_label] = self.current_proof_log
         vprint(3, 'Correct proof!')
 
     def dump(self) -> None:
@@ -678,6 +705,16 @@ if __name__ == '__main__':
         help="""file to output logs, expressed using relative path (defaults to
           <stderr>)""")
     parser.add_argument(
+        '-j',
+        '--json-export',
+        dest='json_export',
+        type=argparse.FileType(
+            mode='w',
+            encoding='ascii'),
+        default=sys.stderr,
+        help="""file to export JSON, expressed using relative path (defaults to
+          <stderr>)""")
+    parser.add_argument(
         '-v',
         '--verbosity',
         dest='verbosity',
@@ -701,9 +738,19 @@ if __name__ == '__main__':
     verbosity = args.verbosity
     db_file = args.database
     logfile = args.logfile
+    jsonfile = args.json_export
     vprint(1, 'mmverify.py -- Proof verifier for the Metamath language')
     mm = MM(args.begin_label, args.stop_label)
     vprint(1, 'Reading source file "{}"...'.format(db_file.name))
-    mm.read(Toks(db_file))
+    try:
+        mm.read(Toks(db_file))
+    except SystemExit:
+        vprint(1, 'Stop label reached.')
+    
     vprint(1, 'No errors were found.')
+
+    # Dump extracted proof graphs to a JSON file.
+    with open(jsonfile.name, 'w') as f:
+        json.dump(mm.exported_proofs, f, indent=2)
+    
     # mm.dump()
