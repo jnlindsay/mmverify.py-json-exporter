@@ -7,3 +7,11 @@ Usage:
 ```
 python3 mmverify.py set.mm --json-export set.json  
 ```
+
+To export only a single theorem, say `prmunb`, use:
+
+```
+python3 mmverify.py set.mm --json-export prmunb.json --begin-label prmunb --stop-label prminf
+```
+
+where `primnf` is the theorem directly after `prmunb` in `set.mm`.
