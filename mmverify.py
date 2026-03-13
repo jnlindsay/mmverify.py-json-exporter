@@ -483,6 +483,7 @@ class MM:
         """Carry out the given proof step (given the label to treat and the
         current proof stack).  This modifies the given stack in place.
         """
+        stack_turnstile_before = [s[1] for s in stack if s[0] and s[0][0] == '|-']
         vprint(10, 'Proof step:', step)
         if is_hypothesis(step):
             _steptype, stmt = step
@@ -537,17 +538,20 @@ class MM:
         self.current_step_id += 1
         new_step_id = self.current_step_id
 
-        # Log the step
+        stack.append((new_stmt, new_step_id))
+        vprint(12, 'Proof stack:', stack)
+
+        # Log the step, including the state of the stack.
+        stack_turnstile_after = [s[1] for s in stack if s[0] and s[0][0] == '|-']
         self.current_proof_log.append({
             "step": new_step_id,
             "ref": step_label,
             "type": new_stmt[0],
             "expr": " ".join(new_stmt),
-            "args": popped_ids
+            "args": popped_ids,
+            "stack_turnstile_before": stack_turnstile_before,
+            "stack_turnstile_after": stack_turnstile_after
         })
-
-        stack.append((new_stmt, new_step_id))
-        vprint(12, 'Proof stack:', stack)
 
     def treat_normal_proof(self, proof: list[str], proof_label: str) -> list[Stmt]:
         """Return the proof stack once the given normal proof has been
@@ -567,7 +571,7 @@ class MM:
                     else:
                         raise MMError(f"The label {label} is the label of a nonactive hypothesis.")
                 else:
-                    self.treat_step(stmt_info, stack)
+                    self.treat_step(stmt_info, stack, label)
             else:
                 raise MMError(f"No statement information found for label {label}")
         return stack
