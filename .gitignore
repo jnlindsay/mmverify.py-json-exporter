@@ -1,3 +1,4 @@
-*.mm
-*.log
 *.json
+*.log
+*.mm
+*.pyc
