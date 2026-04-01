@@ -301,19 +301,50 @@ def apply_subst(stmt: Stmt, subst: dict[Var, Stmt]) -> Stmt:
 class MM:
     """Class of ("abstract syntax trees" describing) Metamath databases."""
 
-    def __init__(self, begin_label: Label, stop_label: Label) -> None:
+    def __init__(self, begin_label: Label, stop_label: Label, only_type: typing.Optional[str] = None) -> None:
         """Construct an empty Metamath database."""
         self.constants: set[Const] = set()
         self.fs = FrameStack()
         self.labels: dict[Label, FullStmt] = {}
         self.begin_label = begin_label
         self.stop_label = stop_label
+        self.only_type = only_type
         self.verify_proofs = not self.begin_label
 
         # Variables for JSON export.
         self.exported_proofs = {}
         self.current_step_id = 0
         self.current_proof_log = []
+        self.step_id_to_type: dict[int, str] = {}
+
+    def _reset_proof_export_state(self) -> None:
+        """Reset per-proof JSON export state."""
+        self.current_step_id = 0
+        self.current_proof_log = []
+        self.step_id_to_type = {}
+
+    def _log_and_push_step(
+            self,
+            new_stmt: Stmt,
+            stack: list[tuple[Stmt, int]],
+            step_label: str,
+            popped_ids: list[int]) -> None:
+        """Assign a fresh step ID, log the step, and push it onto the stack."""
+        self.current_step_id += 1
+        new_step_id = self.current_step_id
+        step_type = new_stmt[0] if new_stmt else ''
+
+        self.step_id_to_type[new_step_id] = step_type
+
+        self.current_proof_log.append({
+            "step": new_step_id,
+            "ref": step_label,
+            "type": step_type,
+            "expr": " ".join(new_stmt),
+            "args": popped_ids
+        })
+
+        stack.append((new_stmt, new_step_id))
 
     def add_c(self, tok: Const) -> None:
         """Add a constant to the database."""
@@ -478,7 +509,7 @@ class MM:
 
     def treat_step(self,
                    step: FullStmt,
-                   stack: list[Stmt],
+                   stack: list[tuple[Stmt, int]],
                    step_label: str) -> None:
         """Carry out the given proof step (given the label to treat and the
         current proof stack).  This modifies the given stack in place.
@@ -533,29 +564,16 @@ class MM:
             del stack[len(stack) - npop:]
             new_stmt = apply_subst(conclusion0, subst)
 
-        # Generate a new monotonically increasing step ID for JSON export.
-        self.current_step_id += 1
-        new_step_id = self.current_step_id
-
-        # Log the step
-        self.current_proof_log.append({
-            "step": new_step_id,
-            "ref": step_label,
-            "type": new_stmt[0],
-            "expr": " ".join(new_stmt),
-            "args": popped_ids
-        })
-
-        stack.append((new_stmt, new_step_id))
+        # Logged proof steps (labels and assertions) receive fresh step IDs.
+        self._log_and_push_step(new_stmt, stack, step_label, popped_ids)
         vprint(12, 'Proof stack:', stack)
 
-    def treat_normal_proof(self, proof: list[str], proof_label: str) -> list[Stmt]:
+    def treat_normal_proof(self, proof: list[str]) -> list[Stmt]:
         """Return the proof stack once the given normal proof has been
         processed.
         """
         stack: list[tuple[Stmt, int]] = []
-        self.current_step_id = 0
-        self.current_proof_log = []
+        self._reset_proof_export_state()
         active_hypotheses = {label for frame in self.fs for labels in (frame.f_labels, frame.e_labels) for label in labels.values()}
         for label in proof:
             stmt_info = self.labels.get(label)
@@ -567,7 +585,7 @@ class MM:
                     else:
                         raise MMError(f"The label {label} is the label of a nonactive hypothesis.")
                 else:
-                    self.treat_step(stmt_info, stack)
+                    self.treat_step(stmt_info, stack, label)
             else:
                 raise MMError(f"No statement information found for label {label}")
         return stack
@@ -576,8 +594,7 @@ class MM:
             self,
             f_hyps: list[Fhyp],
             e_hyps: list[Ehyp],
-            proof: list[str],
-            proof_label: str) -> list[Stmt]:
+            proof: list[str]) -> list[Stmt]:
         """Return the proof stack once the given compressed proof for an
         assertion with the given $f and $e-hypotheses has been processed.
         """
@@ -606,10 +623,9 @@ class MM:
         vprint(5, 'Integer-coded steps:', proof_ints)
         # Processing of the proof
         stack: list[tuple[Stmt, int]] = []  # proof stack
-        self.current_step_id = 0
-        self.current_proof_log = []
+        self._reset_proof_export_state()
         # statements saved for later reuse (marked with a 'Z')
-        saved_stmts = []
+        saved_stmts: list[tuple[Stmt, int]] = []
         # can be recovered as len(saved_stmts) but less efficient
         n_saved_stmts = 0
         for proof_int in proof_ints:
@@ -629,9 +645,14 @@ class MM:
                     "the {}th).").format(
                         n_saved_stmts,
                         proof_int))
-            else: # Re-pushing the saved tuple directly retains its original Step ID
-                stmt = saved_stmts[proof_int - label_end]
-                stack.append(stmt)
+            else:
+                # Replaying a saved step is an internal stack operation:
+                # count it in global step numbering, but do not export a JSON row.
+                # Preserve the original step ID on the stack so downstream args
+                # still point to the original derivation (not an @ replay row).
+                self.current_step_id += 1
+                saved_stmt, saved_step_id = saved_stmts[proof_int - label_end]
+                stack.append((saved_stmt, saved_step_id))
         return stack
 
     def verify(
@@ -648,9 +669,9 @@ class MM:
         # assertion as an argument since other dv conditions corresponding to
         # dummy variables should be 'lookup_d'ed anyway.
         if proof[0] == '(':  # compressed format
-            stack = self.treat_compressed_proof(f_hyps, e_hyps, proof, proof_label)
+            stack = self.treat_compressed_proof(f_hyps, e_hyps, proof)
         else:  # normal format
-            stack = self.treat_normal_proof(proof, proof_label)
+            stack = self.treat_normal_proof(proof)
         vprint(10, 'Stack at end of proof:', stack)
         if not stack:
             raise MMError(
@@ -664,7 +685,26 @@ class MM:
         if stack[0][0] != conclusion:
             raise MMError(("Stack entry {} does not match proved " +
                           " assertion {}.").format(stack[0][0], conclusion))
-        self.exported_proofs[proof_label] = self.current_proof_log
+        if self.only_type is None:
+            exported_steps = self.current_proof_log
+        elif self.only_type == '|-':
+            exported_steps = []
+            for step in self.current_proof_log:
+                if step["type"] != '|-':
+                    continue
+                filtered_step = step.copy()
+                filtered_step["args"] = [
+                    dep_id for dep_id in step["args"]
+                    if self.step_id_to_type.get(dep_id) == '|-'
+                ]
+                exported_steps.append(filtered_step)
+        else:
+            # Preserve original step numbering by filtering after step IDs are assigned.
+            exported_steps = [
+                step for step in self.current_proof_log
+                if step["type"] == self.only_type
+            ]
+        self.exported_proofs[proof_label] = exported_steps
         vprint(3, 'Correct proof!')
 
     def dump(self) -> None:
@@ -734,13 +774,18 @@ if __name__ == '__main__':
         dest='stop_label',
         type=str,
         help='label where to stop verifying proofs (not included)')
+    parser.add_argument(
+        '--only-type',
+        dest='only_type',
+        type=str,
+        help='export only proof steps whose type exactly matches this value (for example: |- )')
     args = parser.parse_args()
     verbosity = args.verbosity
     db_file = args.database
     logfile = args.logfile
     jsonfile = args.json_export
     vprint(1, 'mmverify.py -- Proof verifier for the Metamath language')
-    mm = MM(args.begin_label, args.stop_label)
+    mm = MM(args.begin_label, args.stop_label, args.only_type)
     vprint(1, 'Reading source file "{}"...'.format(db_file.name))
     try:
         mm.read(Toks(db_file))
