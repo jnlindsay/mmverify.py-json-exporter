@@ -193,7 +193,7 @@ class Frame:
         self.d: set[Dv] = set()
         self.f: list[Fhyp] = []
         self.f_labels: dict[Var, Label] = {}
-        self.e: list[Ehyp] = []
+        self.e: list[tuple[Ehyp, Label]] = []
         self.e_labels: dict[tuple[Symbol, ...], Label] = {}
         # Note: both self.e and self.e_labels are needed since the keys of
         # self.e_labels form a set, but the order and repetitions of self.e
@@ -214,9 +214,16 @@ class FrameStack(list[Frame]):
         top.
         """
         frame = self[-1]
-        frame.e.append(stmt)
+        frame.e.append((stmt, label))
         frame.e_labels[tuple(stmt)] = label
         # conversion to tuple since dictionary keys must be hashable
+
+    def active_e_labels(self) -> list[Label]:
+        """Return active essential-hypothesis labels in assertion order.
+
+        This preserves duplicates, unlike dictionary lookup by statement.
+        """
+        return [label for fr in self for _stmt, label in fr.e]
 
     def add_d(self, varlist: list[Var]) -> None:
         """Add a disjoint variable condition (ordered pair of variables) to
@@ -268,7 +275,7 @@ class FrameStack(list[Frame]):
         hypotheses, essential hypotheses, conclusion) describing the given
         assertion.
         """
-        e_hyps = [eh for fr in self for eh in fr.e]
+        e_hyps = [eh for fr in self for eh, _label in fr.e]
         mand_vars = {tok for hyp in itertools.chain(e_hyps, [stmt])
                      for tok in hyp if self.lookup_v(tok)}
         dvs = {(x, y) for fr in self for (x, y)
@@ -316,6 +323,7 @@ class MM:
         self.current_step_id = 0
         self.current_proof_log = []
         self.step_id_to_type: dict[int, str] = {}
+        self.proof_e_labels: dict[Label, list[Label]] = {}
 
     def _reset_proof_export_state(self) -> None:
         """Reset per-proof JSON export state."""
@@ -479,6 +487,7 @@ class MM:
                     raise MMError('$p must have label')
                 stmt, proof = self.read_p_stmt(toks)
                 dvs, f_hyps, e_hyps, conclusion = self.fs.make_assertion(stmt)
+                self.proof_e_labels[label] = self.fs.active_e_labels()
                 if self.verify_proofs:
                     vprint(2, 'Verify:', label)
                     self.verify(f_hyps, e_hyps, conclusion, proof, label)
@@ -594,13 +603,14 @@ class MM:
             self,
             f_hyps: list[Fhyp],
             e_hyps: list[Ehyp],
-            proof: list[str]) -> list[Stmt]:
+            proof: list[str],
+            e_labels_for_proof: list[Label]) -> list[Stmt]:
         """Return the proof stack once the given compressed proof for an
         assertion with the given $f and $e-hypotheses has been processed.
         """
         # Preprocessing and building the lists of proof_ints and labels
         flabels = [self.fs.lookup_f(v) for _, v in f_hyps]
-        elabels = [self.fs.lookup_e(s) for s in e_hyps]
+        elabels = e_labels_for_proof
         plabels = flabels + elabels  # labels of implicit hypotheses
         idx_bloc = proof.index(')')  # index of end of label bloc
         plabels += proof[1:idx_bloc]  # labels which will be referenced later
@@ -669,7 +679,11 @@ class MM:
         # assertion as an argument since other dv conditions corresponding to
         # dummy variables should be 'lookup_d'ed anyway.
         if proof[0] == '(':  # compressed format
-            stack = self.treat_compressed_proof(f_hyps, e_hyps, proof)
+            stack = self.treat_compressed_proof(
+                f_hyps,
+                e_hyps,
+                proof,
+                self.proof_e_labels.get(proof_label, []))
         else:  # normal format
             stack = self.treat_normal_proof(proof)
         vprint(10, 'Stack at end of proof:', stack)
